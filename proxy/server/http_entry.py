@@ -12,12 +12,14 @@ from proxy.upstream.httpx_helper import helper
 import json
 from fastapi import Response
 import httpx
+from proxy.loadbalancer.healthcheck import health_check
+from proxy.loadbalancer.backends import BACKENDS
+from proxy.loadbalancer.selector import server_indexing
+import asyncio
+
 
 redis_port = os.getenv("REDIS_PORT", 6379)
 redis_host = os.getenv("REDIS_HOST", "localhost")
-base_url = "http://localhost:5000"
-
-# app = FastAPI()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -30,6 +32,9 @@ async def lifespan(app: FastAPI):
     
     app.state.redis_client = client
 
+    # start health checks on servers
+    task = asyncio.create_task(health_check(backend_servers=BACKENDS))
+
 
     async with aiofiles.open('../redis/scripts/verify_fingerprint.lua', mode='r') as f:
         verify_script = await f.read()
@@ -40,19 +45,27 @@ async def lifespan(app: FastAPI):
     app.state.verify_script = verify_script
     app.state.verify_script_sha1 = verify_script_sha1
 
-
-
-    yield 
+    yield
     
+    # cancel the health check after lifesp end    
+    task.cancel()
+    
+
+    try: # need to signal the cancel to event loop
+        await task
+    except asyncio.CancelledError:
+        print("Task cancelled.")
+        
+    #redis close
     await client.aclose()
+    
     
 app = FastAPI(lifespan=lifespan)
 
 
-
 @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def catchall(request : Request, path_name : str):
-    
+
     method = request.method
     headers = request.headers
     body = await request.body()
@@ -60,15 +73,18 @@ async def catchall(request : Request, path_name : str):
     
     TTL = 60
     incoming_path = f"/{path}"
-    target = base_url + incoming_path
+
     upstream_response = None
-    
     
     redis_client = request.app.state.redis_client
     boolean_result = validation(method, headers)
-
     
     if boolean_result:
+
+        idem_key = headers.get('idempotency-key')
+        base_url = server_indexing(idem_key=idem_key)
+        target = base_url + incoming_path
+    
         if method == "GET":
             try:
                 upstream_response = await helper(method, headers, body, target_url=target) # pass get req directly since it doesnt affect server state
@@ -88,7 +104,7 @@ async def catchall(request : Request, path_name : str):
         else:
             fingerprint = create_fingerprint(method, path, body)
             try:
-                result = await redis_client.evalsha(request.app.state.verify_script_sha1,1, headers['idempotency-key'], fingerprint, TTL)
+                result = await redis_client.evalsha(request.app.state.verify_script_sha1,1, headers.get('idempotency-key'), fingerprint, TTL)
             except NoScriptError as e:
                 verify_script_sha1 = await redis_client.script_load(request.app.state.verify_script)
                 result = await redis_client.evalsha(verify_script_sha1, 1, headers["idempotency-key"], fingerprint, TTL)
@@ -114,7 +130,7 @@ async def catchall(request : Request, path_name : str):
                         content='upstream timeout',
                         headers={'content-type': 'text/plain'}
                     )
-                await redis_client.hset(headers['idempotency-key'], mapping = {
+                await redis_client.hset(headers.get('idempotency-key'), mapping = {
                     'state': 'COMPLETED', 
                     'body': upstream_response.content,
                     'headers': json.dumps(dict(upstream_response.headers)),
@@ -129,7 +145,7 @@ async def catchall(request : Request, path_name : str):
                 
             elif result == 'REPLAY':
                 
-                upstream_response = await redis_client.hmget(headers['idempotency-key'], ['body', 'headers', 'status-code'])
+                upstream_response = await redis_client.hmget(headers.get('idempotency-key'), ['body', 'headers', 'status-code'])
                 
                 return Response(
                     content=upstream_response[0],
